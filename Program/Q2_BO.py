@@ -1,8 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-问题2: 使用贝叶斯优化自动搜索 FY1 的飞行方向、速度、投放时刻、起爆延时，
-最大化对导弹 M1 的有效遮蔽时间(视线遮挡判定)并修正遮蔽区间绘图的 bug.
-"""
 import time
 import numpy as np
 from skopt import gp_minimize
@@ -11,7 +7,7 @@ from skopt.utils import use_named_args
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
-# 配置matplot
+# 配置matplot中文显示
 plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 
@@ -26,7 +22,7 @@ M0 = np.array([20000.0, 0.0, 2000.0])  # 初始位置
 vm = 300.0  # 速度 m/s，指向假目标
 um = (O - M0) / np.linalg.norm(O - M0)  # 单位方向向量
 T_hit = np.linalg.norm(O - M0) / vm  # 导弹到达假目标时刻
-# 真目标，近似用中心点表示视线目标点
+# 真目标，近似用中心点表示视线目标点 (下底面圆心 (0,200,0)，高10m，取中心 (0,200,5))
 T_true = np.array([0.0, 200.0, 5.0])
 # 无人机 FY1 初始信息
 F0 = np.array([17800.0, 0.0, 1800.0])  # 初始位置
@@ -43,52 +39,71 @@ def missile_pos(t: float) -> np.ndarray:
     """导弹在时间 t 的位置"""
     return M0 + vm * t * um
 
-def distance_point_to_segment(P: np.ndarray, A: np.ndarray, B: np.ndarray) -> float:
-    """点 P 到线段 AB 的最小距离."""
+
+def point_to_segment_distance_and_param(P: np.ndarray, A: np.ndarray, B: np.ndarray):
+    """
+    返回：
+      - dist: 点P到线段AB的最小距离（基于投影）
+      - u_raw: 投影参数（未夹紧） = dot(P-A, AB)/|AB|^2
+      - u_clamped: 投影参数夹紧到 [0,1]
+      - closest: 最近点坐标（使用夹紧后的参数）
+    """
     AB = B - A
     AB2 = np.dot(AB, AB)
     if AB2 <= 1e-12:
-        return np.linalg.norm(P - A)
-    u = np.dot(P - A, AB) / AB2
-    u = max(0.0, min(1.0, u))
-    closest = A + u * AB
-    return np.linalg.norm(P - closest)
+        return np.linalg.norm(P - A), 0.0, 0.0, A
+    u_raw = np.dot(P - A, AB) / AB2
+    u_clamped = max(0.0, min(1.0, u_raw))
+    closest = A + u_clamped * AB
+    dist = np.linalg.norm(P - closest)
+    return dist, u_raw, u_clamped, closest
+
 
 def simulate_coverage(v_uav: float, theta: float, t_drop: float, tau: float):
     """
-    给定 UAV 速度/航向/投放时刻/引信延时，返回: 
+    给定 UAV 速度/航向/投放时刻/引信延时，返回:
     - cover_time: 遮蔽总时长(秒)
     - intervals: 遮蔽时间区间列表 [(t1_start, t1_end), ...]
     - drop_point: 投放点坐标
     - explode_point: 起爆点坐标
     - explode_time: 起爆时刻
+    说明：
+       - UAV 等高度匀速直线飞行，投放后弹体作抛体运动（初速等于 UAV 水平速度向量，z 受重力）
+       - 起爆后云团中心以 3 m/s 下沉，持续 smoke_duration 秒有效
+       - 遮蔽判定：当且仅当 云心到线段 [M(t), T_true] 的投影参数 u_raw ∈ [0,1] 且距离 ≤ R_eff，则认为烟幕挡在导弹与目标之间（有效）
     """
     uf = np.array([np.cos(theta), np.sin(theta), 0.0])
     vf = v_uav * uf
+    # 投放点（UAV 等高度）
     drop_point = F0 + vf * t_drop
     drop_point[2] = F0[2]
     t_exp = t_drop + tau
+    # 抛体位移计算起爆点
     explode_point = drop_point + vf * tau + np.array([0.0, 0.0, -0.5 * g * tau * tau])
-    
+
+    # 若起爆点落地或地下，不可行
     if explode_point[2] <= 0.0:
         return 0.0, [], drop_point, explode_point, t_exp
-    
+
+    # 有效检测时间段
     t0 = t_exp
     t1 = min(t_exp + smoke_duration, T_hit)
     if t1 <= t0:
         return 0.0, [], drop_point, explode_point, t_exp
-    
-    times = np.arange(t0, t1 + dt_eval/2, dt_eval)
+
+    times = np.arange(t0, t1 + dt_eval / 2, dt_eval)
     covered_mask = np.zeros_like(times, dtype=bool)
-    
+
     for idx, t in enumerate(times):
         Cm = explode_point + np.array([0.0, 0.0, -sink_speed * (t - t_exp)])
         Mt = missile_pos(t)
-        dist = distance_point_to_segment(Cm, Mt, T_true)
-        covered_mask[idx] = (dist <= R_eff)
-    
+        dist, u_raw, u_clamped, closest = point_to_segment_distance_and_param(Cm, Mt, T_true)
+        # 这里使用 u_raw 判断云团是否在严格的导弹—目标线段之间
+        if (0.0 <= u_raw <= 1.0) and (dist <= R_eff):
+            covered_mask[idx] = True
+
     cover_time = float(np.sum(covered_mask) * dt_eval)
-    
+
     intervals = []
     if np.any(covered_mask):
         edges = np.diff(covered_mask.astype(int))
@@ -100,11 +115,13 @@ def simulate_coverage(v_uav: float, theta: float, t_drop: float, tau: float):
             ends = np.r_[ends, covered_mask.size]
         for s, e in zip(starts, ends):
             intervals.append((times[s], times[e - 1] + dt_eval))
-            
+
     return cover_time, intervals, drop_point, explode_point, t_exp
 
+
 '''
-贝叶斯优化目标函数'''
+贝叶斯优化目标函数
+'''
 # 决策变量的搜索空间
 t_drop_max = min(60.0, max(1.0, T_hit - 0.1))
 space = [
@@ -113,6 +130,7 @@ space = [
     Real(0.0, t_drop_max, name="t_drop"),
     Real(0.2, 12.0, name="tau"),
 ]
+
 
 @use_named_args(space)
 def objective(v_uav, theta, t_drop, tau):
@@ -124,6 +142,7 @@ def objective(v_uav, theta, t_drop, tau):
     if explode_point[2] <= 0.0:
         return 1e3
     return -cover_time
+
 
 '''
 封装主函数
@@ -147,13 +166,13 @@ def run_optimization_and_plot(n_calls=60, n_initial_points=12):
         acq_func="EI"
     )
 
-    end_time = time.time()
-    
     # 获取最优解并重新计算结果
     best_v, best_theta, best_t_drop, best_tau = res.x
     best_cover, best_intervals, best_drop, best_explode, best_t_exp = simulate_coverage(
         best_v, best_theta, best_t_drop, best_tau
     )
+
+    end_time = time.time()
 
     # 打印最优解
     print("\n======== 最优解(BO) ========")
@@ -171,8 +190,8 @@ def run_optimization_and_plot(n_calls=60, n_initial_points=12):
             print(f"  [{a:.3f} s, {b:.3f} s]")
     else:
         print("无有效遮蔽区间.")
-        
-    print(f"总耗时: {end_time - start_time:.2f} 秒")
+
+    print(f"程序总耗时: {end_time - start_time:.2f} 秒")
 
     # 3D 轨迹数据
     t_traj = np.linspace(0.0, T_hit, 400)
@@ -182,9 +201,9 @@ def run_optimization_and_plot(n_calls=60, n_initial_points=12):
         C_traj = np.array([best_explode + np.array([0.0, 0.0, -sink_speed*(t - best_t_exp)]) for t in t_smoke])
     else:
         C_traj = np.empty((0, 3))
-    dist_curve = np.array([distance_point_to_segment(C_traj[i], missile_pos(t_smoke[i]), T_true)
+    dist_curve = np.array([point_to_segment_distance_and_param(C_traj[i], missile_pos(t_smoke[i]), T_true)[0]
                            for i in range(len(t_smoke))]) if t_smoke.size > 0 else np.array([])
-    
+
     plt.figure(figsize=(12, 5))
     ax1 = plt.subplot(1, 2, 1, projection='3d')
     ax1.plot(M_traj[:, 0], M_traj[:, 1], M_traj[:, 2], label="导弹轨迹", color='red')
@@ -217,10 +236,11 @@ def run_optimization_and_plot(n_calls=60, n_initial_points=12):
     ax2.set_xlabel("时间 (秒)")
     ax2.set_ylabel("最小距离 (米)")
     ax2.legend(loc='upper right')
-    
+
     plt.tight_layout()
     plt.show()
 
+
 if __name__ == "__main__":
-    # 修改n_call改变评估次数,修改n_initial_points改变初始采样点
+    # 修改 n_calls 改变评估次数, 修改 n_initial_points 改变初始采样点
     run_optimization_and_plot(n_calls=60, n_initial_points=12)
