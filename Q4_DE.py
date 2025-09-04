@@ -24,6 +24,7 @@ class DroneObscurationOptimizer:
         # --- 坐标定义 ---
         self.M1_INITIAL_POS = np.array([20000.0, 0.0, 2000.0])  # 导弹初始位置
         self.FALSE_TARGET_POS = np.array([0.0, 0.0, 0.0])  # 假目标位置
+        # 题目中的真目标下底面圆心在(0,200,0)，高10m，因此中心点在(0,200,5)
         self.TRUE_TARGET_CENTER_POS = np.array([0.0, 200.0, 5.0]) # 真目标中心位置 
 
         self.DRONES_INITIAL_POS = {
@@ -112,7 +113,8 @@ class DroneObscurationOptimizer:
                 if distance <= self.CLOUD_RADIUS:
                     obscuration_times.add(round(t, 1))
         
-        return len(obscuration_times) * 0.1
+        # FIX: 将有效遮蔽时长计算修正为 len(obscuration_times) * 0.2
+        return len(obscuration_times) * 0.2
 
     def _objective_function(self, x):
         """目标函数，用于最大化遮蔽时间，因此需要对结果取负。"""
@@ -226,6 +228,7 @@ class DroneObscurationOptimizer:
 
 if __name__ == '__main__':
     optimizer = DroneObscurationOptimizer()
-    final_results_df = optimizer.solve(population_size=50, max_iterations=150)
+    # 默认值: population_size=40, max_iterations=100
+    final_results_df = optimizer.solve(population_size=200, max_iterations=200)
     print("\n--- 最优策略详情 ---")
     print(final_results_df.to_string())
