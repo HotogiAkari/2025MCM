@@ -503,7 +503,7 @@ def _generate_excel_data(best_params, excel_file_path, missile_paths_cache, time
                 coverage = covered_count * DT
                 if coverage > 0:
                     total_bomb_coverage += coverage
-                    interfered_missiles.append(f"{missile_name} ({coverage:.2f}s)")
+                    interfered_missiles.append(f"{missile_name}")
             
             # 构造单行数据，包含总干扰时长
             data_row = {
