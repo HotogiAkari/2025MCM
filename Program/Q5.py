@@ -722,14 +722,14 @@ def run_full_pipeline(NUM_RUNS, POP_SIZE, MAX_ITER, F_START, F_END, CR_START, CR
 # ======================
 
 if __name__ == "__main__":
-    NUM_RUNS = 5
-    POP_SIZE = 100
-    MAX_ITER = 1000
-    F_START = 0.8
-    F_END = 0.2
-    CR_START = 0.9
-    CR_END = 0.5
-    NUM_LOCAL_ITERS = 3
+    NUM_RUNS = 5            # 运行轮次
+    POP_SIZE = 150          # 种群规模
+    MAX_ITER = 1000         # 最大迭代次数
+    F_START = 0.8           # DE的缩放因子初始值
+    F_END = 0.2             # DE的缩放因子结束值
+    CR_START = 0.9          # GA和DE的交叉概率初始值
+    CR_END = 0.5            # GA和DE的交叉概率结束值
+    NUM_LOCAL_ITERS = 20    # 局部迭代优化次数
     EXCEL_FILE_PATH = "Data/result3.xlsx"
     SEED_FILE_PATH = "Data/Q5/optimization_seed.pkl"
 
