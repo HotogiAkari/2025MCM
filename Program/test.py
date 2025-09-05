@@ -12,6 +12,7 @@ import pickle
 from scipy.optimize import differential_evolution, minimize
 from numba import jit
 from tqdm import tqdm
+import multiprocessing
 
 # ======================
 # 参数设置
@@ -69,27 +70,11 @@ def is_blocked(missile_pos, target_pos, smoke_center, R):
     return d <= R
 
 @jit(nopython=True)
-def missile_pos(t, M_init, target_pos=TARGET_CENTER):
+def missile_pos(t, M_init, target_pos):
     """导弹在时刻 t 的位置"""
     direction = (target_pos - M_init)
     direction = direction / np.linalg.norm(direction)
     return M_init + direction * MISSILE_SPEED * t
-
-@jit(nopython=True)
-def simulate_single_coverage(t_b, pos_b, missile_name, t_max=T_MAX, dt=DT):
-    """计算单个烟幕弹对指定导弹的遮蔽时间"""
-    covered_count = 0
-    missile_init_pos = MISSILE_INITS[missile_name]
-    for t in np.arange(0, t_max, dt):
-        m_pos = missile_pos(t, missile_init_pos, TARGET_CENTER)
-        if t < t_b or t > t_b + SMOKE_LIFE:
-            blocked = False
-        else:
-            smoke_center = np.array([pos_b[0], pos_b[1], pos_b[2] - SMOKE_SINK * (t - t_b)])
-            blocked = is_blocked(m_pos, TARGET_CENTER, smoke_center, SMOKE_RADIUS)
-        if blocked:
-            covered_count += 1
-    return covered_count * dt
 
 # ======================
 # 优化目标函数
@@ -133,11 +118,10 @@ def rough_evaluate(params):
     粗略优化目标函数：最大化所有烟幕弹的独立遮蔽时间总和。
     此阶段忽略烟幕弹之间的重叠。
     """
-    strategy = _parse_params(params)
-    
     if not _check_constraints(params):
         return 1e9 # 巨大的惩罚
-
+    
+    strategy = _parse_params(params)
     total_individual_coverage = 0
     missile_names = list(MISSILE_INITS.keys())
     
@@ -149,8 +133,18 @@ def rough_evaluate(params):
         for t_drop in data['drop_times']:
             pos_b = uav_init_pos + direction * data['v'] * t_drop
             for missile_name in missile_names:
-                coverage = simulate_single_coverage(t_drop, pos_b, missile_name)
-                total_individual_coverage += coverage
+                missile_init_pos = MISSILE_INITS[missile_name]
+                covered_count = 0
+                for t in np.arange(0, T_MAX, DT):
+                    m_pos = missile_pos(t, missile_init_pos, TARGET_CENTER)
+                    if t < t_drop or t > t_drop + SMOKE_LIFE:
+                        blocked = False
+                    else:
+                        smoke_center = np.array([pos_b[0], pos_b[1], pos_b[2] - SMOKE_SINK * (t - t_drop)])
+                        blocked = is_blocked(m_pos, TARGET_CENTER, smoke_center, SMOKE_RADIUS)
+                    if blocked:
+                        covered_count += 1
+                total_individual_coverage += covered_count * DT
                 
     return -total_individual_coverage
 
@@ -189,14 +183,53 @@ def final_evaluate(params):
                 if t < t_b or t > t_b + SMOKE_LIFE:
                     continue
                 smoke_center = np.array([pos_b[0], pos_b[1], pos_b[2] - SMOKE_SINK * (t - t_b)])
-                if is_blocked(m_pos, TARGET_CENTER, smoke_center, SMOKE_RADIUS):
-                    blocked = True
+                blocked = is_blocked(m_pos, TARGET_CENTER, smoke_center, SMOKE_RADIUS)
+                if blocked:
                     break
             if blocked:
                 covered_count += 1
         total_coverage += covered_count * DT
 
     return -total_coverage
+
+def _generate_collaborative_strategy():
+    """生成一个人工设计的、具有协同效果的初始策略"""
+    uav_names = ['FY1', 'FY2', 'FY3', 'FY4', 'FY5']
+    params = []
+    
+    # 一个基于协同干扰的初始策略
+    missile_assignments = {
+        'FY1': 'M1',
+        'FY2': 'M2',
+        'FY3': 'M3',
+        'FY4': 'M1',
+        'FY5': 'M2'
+    }
+    
+    t_drops_by_missile = {
+        'M1': [40.0, 50.0, 60.0],
+        'M2': [30.0, 40.0, 50.0],
+        'M3': [20.0, 30.0, 40.0]
+    }
+    
+    for uav_name in uav_names:
+        uav_init_pos = UAV_INITS[uav_name]
+        assigned_missile_name = missile_assignments[uav_name]
+        assigned_missile_pos = MISSILE_INITS[assigned_missile_name]
+        
+        direction_vector = assigned_missile_pos - uav_init_pos
+        theta_rad = np.arctan2(direction_vector[1], direction_vector[0])
+        theta_deg = np.rad2deg(theta_rad)
+        if theta_deg < 0:
+            theta_deg += 360
+            
+        v = 105.0
+        t_drops = t_drops_by_missile.get(assigned_missile_name, [0.0, 0.0, 0.0]) # 加上get以防万一
+        
+        params.extend([theta_deg, v] + t_drops)
+    
+    return np.array(params)
+
 
 # ======================
 # 结果处理与保存
@@ -207,7 +240,6 @@ def _generate_excel_data(best_params, excel_file_path):
     strategy = _parse_params(best_params)
     data_rows = []
     
-    total_effective_coverage = 0
     summary_data = []
 
     missile_names = list(MISSILE_INITS.keys())
@@ -220,9 +252,19 @@ def _generate_excel_data(best_params, excel_file_path):
         for bomb_idx, t_drop in enumerate(uav_data['drop_times']):
             pos_b = uav_init_pos + direction * uav_data['v'] * t_drop
             
-            bomb_total_coverage = 0
             for missile_name in missile_names:
-                coverage = simulate_single_coverage(t_drop, pos_b, missile_name)
+                missile_init_pos = MISSILE_INITS[missile_name]
+                covered_count = 0
+                for t in np.arange(0, T_MAX, DT):
+                    m_pos = missile_pos(t, missile_init_pos, TARGET_CENTER)
+                    if t < t_drop or t > t_drop + SMOKE_LIFE:
+                        blocked = False
+                    else:
+                        smoke_center = np.array([pos_b[0], pos_b[1], pos_b[2] - SMOKE_SINK * (t - t_drop)])
+                        blocked = is_blocked(m_pos, TARGET_CENTER, smoke_center, SMOKE_RADIUS)
+                    if blocked:
+                        covered_count += 1
+                coverage = covered_count * DT
                 
                 data_rows.append({
                     '无人机名称': uav_name,
@@ -235,7 +277,6 @@ def _generate_excel_data(best_params, excel_file_path):
                     '烟幕干扰弹投放点的z坐标 (m)': pos_b[2],
                     '有效遮蔽时间 (s)': coverage
                 })
-                bomb_total_coverage += coverage
             
     final_score = -final_evaluate(best_params)
     summary_data.append({'总有效遮蔽时间 (s)': final_score})
@@ -281,6 +322,11 @@ def run_optimization(num_runs=5, seed_file_path="Data/Q5/optimization_seed.pkl")
     for _ in range(NUM_UAVS):
         bounds.extend([(0, 360), (70, 140)] + [(0, T_MAX)] * MAX_BOMBS_PER_UAV)
     
+    # 获取CPU核心数以设置并行工作线程
+    workers = multiprocessing.cpu_count()
+    if workers is None:
+        workers = 1
+    
     for run_num in range(1, num_runs + 1):
         print("="*40)
         print(f"开始第 {run_num}/{num_runs} 次混合优化运行")
@@ -295,7 +341,7 @@ def run_optimization(num_runs=5, seed_file_path="Data/Q5/optimization_seed.pkl")
         print(f"开始使用新随机种子: {current_seed} 进行优化...")
         
         # --- 阶段1: 粗略优化 (最大化所有烟幕弹的独立贡献) ---
-        print("=== 阶段1: 开始粗略优化 (全局搜索) ===")
+        print("=== 阶段1: 开始粗略优化 (全局并行搜索) ===")
         
         rough_result = differential_evolution(
             rough_evaluate,
@@ -304,7 +350,9 @@ def run_optimization(num_runs=5, seed_file_path="Data/Q5/optimization_seed.pkl")
             popsize=100,
             polish=False,
             disp=True,
-            seed=current_seed
+            seed=current_seed,
+            x0=[_generate_collaborative_strategy()], # 将协同策略作为初始猜想
+            workers=workers # 启用并行
         )
         
         rough_best_params = rough_result.x
@@ -322,23 +370,37 @@ def run_optimization(num_runs=5, seed_file_path="Data/Q5/optimization_seed.pkl")
             x0=rough_best_params,
             polish=False, # 关闭DE的内部polish
             disp=True,
-            seed=current_seed
+            seed=current_seed,
+            workers=workers # 启用并行
         )
-        
-        fine_de_params = fine_de_result.x
         
         # 2b: 从 DE 的结果出发，使用局部优化器进行精确抛光
-        print("\n--- 子阶段 2b: L-BFGS-B (局部精确抛光) ---")
-        fine_polish_result = minimize(
-            final_evaluate,
-            x0=fine_de_params,
-            method='L-BFGS-B',
-            bounds=bounds,
-            options={'disp': True}
-        )
+        print("\n--- 子阶段 2b: L-BFGS-B (多点局部精确抛光) ---")
         
-        final_best_params = fine_polish_result.x
-        final_total_coverage = -fine_polish_result.fun
+        # 选出表现最好的前5个候选者进行局部优化
+        top_candidates_indices = np.argsort(fine_de_result.fun)[:5]
+        top_candidates = fine_de_result.population_x[top_candidates_indices]
+
+        best_polish_params = fine_de_result.x
+        best_polish_score = -fine_de_result.fun
+        
+        for i, x0 in enumerate(top_candidates):
+            print(f"--- 抛光第 {i+1} 个候选者 ---")
+            fine_polish_result = minimize(
+                final_evaluate,
+                x0=x0,
+                method='L-BFGS-B',
+                bounds=bounds,
+                options={'disp': True}
+            )
+            
+            current_score = -fine_polish_result.fun
+            if current_score > best_polish_score:
+                best_polish_score = current_score
+                best_polish_params = fine_polish_result.x
+                
+        final_best_params = best_polish_params
+        final_total_coverage = best_polish_score
 
         print("\n=== 混合优化后的最终结果 ===")
         print(f"最终总遮蔽时间: {final_total_coverage:.2f} s")
@@ -360,7 +422,7 @@ def run_optimization(num_runs=5, seed_file_path="Data/Q5/optimization_seed.pkl")
 if __name__ == "__main__":
     NUM_RUNS_TO_RUN = 5 # 更改运行的次数
     SEED_FILE_PATH = "Data/Q5/optimization_seed.pkl"
-    EXCEL_FILE_PATH = "result3.xlsx"
+    EXCEL_FILE_PATH = "result5.xlsx"
 
     best_params, best_coverage = run_optimization(num_runs=NUM_RUNS_TO_RUN, seed_file_path=SEED_FILE_PATH)
     
