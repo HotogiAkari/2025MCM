@@ -31,6 +31,11 @@ R_eff = 10.0  # 有效半径 10m
 smoke_duration = 20.0  # 起爆后有效时长 20s
 sink_speed = 3.0  # 云团下沉速度 3m/s
 g = 9.8  # 假设重力加速度为 9.8m/s^2
+
+# 新增: 真目标参数
+# 目标为半径7m，高10m的圆柱体，中心点为 T_true (0,200,5)
+R_target = 7.0
+
 # 评估时间步长(越小越精确，计算越慢)
 dt_eval = 0.02
 
@@ -68,9 +73,10 @@ def simulate_coverage(v_uav: float, theta: float, t_drop: float, tau: float):
     - explode_point: 起爆点坐标
     - explode_time: 起爆时刻
     说明：
-       - UAV 等高度匀速直线飞行，投放后弹体作抛体运动（初速等于 UAV 水平速度向量，z 受重力）
-       - 起爆后云团中心以 3 m/s 下沉，持续 smoke_duration 秒有效
-       - 遮蔽判定：当且仅当 云心到线段 [M(t), T_true] 的投影参数 u_raw ∈ [0,1] 且距离 ≤ R_eff，则认为烟幕挡在导弹与目标之间（有效）
+        - UAV 等高度匀速直线飞行，投放后弹体作抛体运动（初速等于 UAV 水平速度向量，z 受重力）
+        - 起爆后云团中心以 3 m/s 下沉，持续 smoke_duration 秒有效
+        - 遮蔽判定: 烟幕所在半径10m的球体完全阻挡在导弹与真目标之间。
+          这等价于烟幕云团的中心到导弹-真目标视线线段的距离（dist）加上目标半径（R_target）小于等于烟幕有效半径（R_eff），即 dist <= R_eff - R_target。
     """
     uf = np.array([np.cos(theta), np.sin(theta), 0.0])
     vf = v_uav * uf
@@ -94,12 +100,16 @@ def simulate_coverage(v_uav: float, theta: float, t_drop: float, tau: float):
     times = np.arange(t0, t1 + dt_eval / 2, dt_eval)
     covered_mask = np.zeros_like(times, dtype=bool)
 
+    # 遮蔽判定：烟幕中心到视线距离 <= 烟幕有效半径 - 目标半径
+    # 这确保了烟幕球体可以完全遮盖目标圆柱体
+    required_dist = R_eff - R_target
+
     for idx, t in enumerate(times):
         Cm = explode_point + np.array([0.0, 0.0, -sink_speed * (t - t_exp)])
         Mt = missile_pos(t)
         dist, u_raw, u_clamped, closest = point_to_segment_distance_and_param(Cm, Mt, T_true)
-        # 这里使用 u_raw 判断云团是否在严格的导弹—目标线段之间
-        if (0.0 <= u_raw <= 1.0) and (dist <= R_eff):
+        # 使用 u_raw 判断云团是否在严格的导弹—目标线段之间
+        if (0.0 <= u_raw <= 1.0) and (dist <= required_dist):
             covered_mask[idx] = True
 
     cover_time = float(np.sum(covered_mask) * dt_eval)
@@ -126,7 +136,7 @@ def simulate_coverage(v_uav: float, theta: float, t_drop: float, tau: float):
 t_drop_max = min(60.0, max(1.0, T_hit - 0.1))
 space = [
     Real(70.0, 140.0, name="v_uav"),
-    Real(0.0, 2.0 * np.pi, name="theta"),
+    Real(0.0, np.pi, name="theta"), # 新增：限制 theta 范围为 [0, pi]，确保 y 方向分量大于0
     Real(0.0, t_drop_max, name="t_drop"),
     Real(0.2, 12.0, name="tau"),
 ]
@@ -177,7 +187,7 @@ def run_optimization_and_plot(n_calls=60, n_initial_points=12):
     # 打印最优解
     print("\n======== 最优解(BO) ========")
     print(f"无人机速度 v_uav: {best_v:.3f} m/s")
-    print(f"航向角 theta: {best_theta:.6f} rad(相对 x 轴)")
+    print(f"航向角 theta: {best_theta:.6f} rad (相对 x 轴)")
     print(f"投放时刻 t_drop: {best_t_drop:.3f} s")
     print(f"起爆延时 tau: {best_tau:.3f} s")
     print(f"起爆时刻 t_exp: {best_t_exp:.3f} s")
@@ -222,7 +232,7 @@ def run_optimization_and_plot(n_calls=60, n_initial_points=12):
     ax2 = plt.subplot(1, 2, 2)
     if t_smoke.size > 0:
         ax2.plot(t_smoke, dist_curve, label="距离: 云团中心→视线(导弹-真目标)", color='tab:blue')
-    ax2.axhline(y=R_eff, linestyle='--', color='r', label="烟幕有效半径")
+    ax2.axhline(y=R_eff - R_target, linestyle='--', color='r', label="有效遮蔽阈值")
     if best_intervals and t_smoke.size > 0:
         shaded_plotted = False
         for (a, b) in best_intervals:
