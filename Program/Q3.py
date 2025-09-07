@@ -1,405 +1,662 @@
 # -*- coding: utf-8 -*-
 """
 问题3：使用FY1投放3枚烟幕弹干扰M1
-优化方法：差分进化搜索最佳航向、速度和投放时机
-新增功能：
+优化方法：差分进化搜索最佳航向、速度、投放时机和爆炸延迟
+功能：
 1. 保存产生最优解的随机种子，以便复现。
 2. 采用“先粗略后精细”的三阶段优化策略。
 3. 调整Excel输出格式，使其更清晰。
+4. 改进了烟幕干扰判定条件：判定真目标完全处于导弹与烟雾组成的锥体内。
+5. 增加实时进度条，方便监控优化过程。
+6. 新增功能：优化烟幕弹投掷后爆炸延迟时间。
 """
 
+import os
+import time
+import pickle
 import numpy as np
 import pandas as pd
-import os
-import pickle
-from scipy.optimize import differential_evolution
+import matplotlib.pyplot as plt
 from tqdm import tqdm
-import sys
+from scipy.optimize import differential_evolution
 
-# ======================
-# 参数设置
-# ======================
+# 设置matplotlib中文字体
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
 
-MISSILE_SPEED = 300.0   # 导弹速度 (m/s)
-SMOKE_RADIUS = 10.0     # 烟幕有效半径
-SMOKE_LIFE = 20.0       # 有效时长 (s)
-SMOKE_SINK = 3.0        # 烟幕下沉速度 (m/s)
-DT = 0.1                # 模拟时间步长
-NUM_BOMBS = 3           # 烟幕弹数量
+# ---------------------------
+# 设备选择：xp = cupy or numpy
+# ---------------------------
+try:
+    import cupy as cp
+    try:
+        devcount = cp.cuda.runtime.getDeviceCount()
+    except Exception:
+        devcount = 0
+    if devcount > 0:
+        xp = cp
+        USE_GPU = True
+        print(f"使用 CuPy (GPU)，设备数量: {devcount}")
+    else:
+        xp = np
+        USE_GPU = False
+        print("未检测到可用 GPU，使用 NumPy")
+except Exception:
+    xp = np
+    USE_GPU = False
+    print("无法导入 CuPy，使用 NumPy")
 
-# 目标（圆柱，近似中心点）
-TARGET_CENTER = np.array([0.0, 200.0, 5.0])
+# ---------------------------
+# 仿真 / 物理 参数（可调整）
+# ---------------------------
+# 导弹 (M1)：以固定的速度和轨迹飞行
+MISSILE_SPEED = 300.0   # m/s
+MISSILE_INIT = np.array([20000.0, 0.0, 2000.0]) # 初始位置
+# 目标 (M1)：圆柱形，位于 (0,0,0)
+TARGET_CENTER = np.array([0.0, 0.0, 0.0])
+TARGET_RADIUS = 7.0
+TARGET_HEIGHT = 10.0
 
-# 导弹初始位置 (M1)
-MISSILE_INIT = np.array([20000.0, 0.0, 2000.0])
-
-# 无人机 FY1 初始位置
+# 无人机 (FY1)：从固定初始位置出发，航向和速度确定后不再改变
 UAV_INIT = np.array([17800.0, 0.0, 1800.0])
 
-# 最大仿真时间，根据导弹命中目标时间确定
+# 烟幕弹：共3枚，每个具有固定物理特性
+SMOKE_RADIUS = 10.0     # 烟雾半径
+SMOKE_LIFE = 20.0       # 烟雾持续时间
+SMOKE_SINK = 3.0        # 烟雾下沉速度
+NUM_BOMBS = 3
+
+# 物理常数与仿真参数
+GRAVITY = 9.8           # 重力加速度，m/s^2
+DT = 0.1                # 仿真时间步长
+
+# 烟幕弹自由落体到地面所需时间
+T_FALL_MAX = np.sqrt(2 * UAV_INIT[2] / GRAVITY)
+
+# 最大模拟时间（基于导弹到目标的飞行时间）
 T_MAX = np.linalg.norm(TARGET_CENTER - MISSILE_INIT) / MISSILE_SPEED
-T_MAX = round(T_MAX, 1) + 1.0 # 确保模拟时间足够
+T_MAX = float(np.round(T_MAX, 1) + 1.0)
 
-# ======================
-# 工具函数
-# ======================
+# 转换到 xp 变量（统一）
+TARGET_CENTER_XP = xp.array(TARGET_CENTER, dtype=xp.float64)
+TARGET_RADIUS_XP = xp.array(TARGET_RADIUS, dtype=xp.float64)
+TARGET_HEIGHT_XP = xp.array(TARGET_HEIGHT, dtype=xp.float64)
+MISSILE_INIT_XP = xp.array(MISSILE_INIT, dtype=xp.float64)
+UAV_INIT_XP = xp.array(UAV_INIT, dtype=xp.float64)
+SMOKE_RADIUS_XP = xp.array(SMOKE_RADIUS, dtype=xp.float64)
 
-def line_segment_point_dist(p1, p2, q):
-    """点 q 到线段 p1-p2 的最小距离"""
+# 时间网格（xp）
+TIMES_XP = xp.arange(0.0, T_MAX + 1e-9, DT, dtype=xp.float64)
+NUM_TIMES = int(TIMES_XP.shape[0])
+
+# 预计算导弹轨迹（xp）
+def _missile_pos_vec(times_xp):
+    dir_vec = (TARGET_CENTER_XP - MISSILE_INIT_XP)
+    dir_vec = dir_vec / xp.linalg.norm(dir_vec)
+    return MISSILE_INIT_XP[None, :] + xp.outer(times_xp, dir_vec * MISSILE_SPEED)
+
+MISSILE_TRAJ_XP = _missile_pos_vec(TIMES_XP)  # shape (T,3)
+
+# ---------------------------
+# 基础工具（都用 xp）
+# ---------------------------
+def normalize_xy(dx, dy):
+    """
+    输入 dx, dy（Python 数值或 numpy 标量），在 xp 上返回单位向量 (3,)
+    完全使用 xp API，避免 numpy/cupy 混合转换问题。
+    """
+    arr = xp.asarray([dx, dy], dtype=xp.float64)  # xp array
+    n = xp.linalg.norm(arr) + 1e-12
+    first2 = arr / n
+    # 拼接第三个分量 0.0（xp array）
+    return xp.concatenate([first2, xp.array([0.0], dtype=xp.float64)])  # shape (3,)
+
+# ---------------------------
+# 向量化遮蔽判断（单炸弹）
+# ---------------------------
+def vectorized_block_mask_for_bomb(t_b, pos_b, t_d):
+    """
+    t_b: 投放时间，float (Python)
+    pos_b: 投放位置，3-element array-like (could be xp array or numpy)
+    t_d: 爆炸延迟时间，float (Python)
+    返回：xp boolean array shape (T,) 表示哪些时间点“完全遮挡目标”
+    算法：中心剪枝 + 圆柱8点检查（向量化）
+    """
+    pos = xp.asarray(pos_b, dtype=xp.float64)
+    # 烟幕有效时间段从 t_b + t_d 开始
+    effective_start_time = float(t_b) + float(t_d)
+    active_mask = (TIMES_XP >= effective_start_time) & (TIMES_XP <= effective_start_time + SMOKE_LIFE)
+    
+    if not xp.any(active_mask):
+        return xp.zeros_like(TIMES_XP, dtype=xp.bool_)
+
+    times_active = TIMES_XP[active_mask]        # (M,)
+    m_pos = MISSILE_TRAJ_XP[active_mask]        # (M,3)
+
+    # 烟幕中心随时间的 z 变化
+    smoke_z = pos[2] - SMOKE_SINK * (times_active - effective_start_time)
+    smoke_centers = xp.stack([
+        xp.full_like(times_active, pos[0]),
+        xp.full_like(times_active, pos[1]),
+        smoke_z
+    ], axis=1)  # (M,3)
+
+    # 快速剪枝：导弹->目标中心线段到 smoke_center 的最短距离
+    p1 = m_pos
+    p2 = xp.broadcast_to(TARGET_CENTER_XP, p1.shape)
     v = p2 - p1
-    w = q - p1
-    t = np.dot(w, v) / (np.dot(v, v) + 1e-9)
-    t = np.clip(t, 0.0, 1.0)
-    closest = p1 + t * v
-    return np.linalg.norm(closest - q)
+    w = smoke_centers - p1
+    vv = xp.sum(v * v, axis=1) + 1e-9
+    tproj = xp.clip(xp.sum(w * v, axis=1) / vv, 0.0, 1.0)
+    closest = p1 + (tproj[:, None] * v)
+    d_center = xp.linalg.norm(closest - smoke_centers, axis=1)
+    center_blocked = d_center <= SMOKE_RADIUS_XP
 
+    if not xp.any(center_blocked):
+        return xp.zeros_like(TIMES_XP, dtype=xp.bool_)
 
-def is_blocked(missile_pos, target_pos, smoke_center, R):
-    """判断烟幕是否阻断导弹与目标之间的视线"""
-    d = line_segment_point_dist(missile_pos, target_pos, smoke_center)
-    return d <= R
+    # 对 center_blocked 时刻检查圆柱的 8 个关键点
+    top_z = TARGET_CENTER_XP[2] + TARGET_HEIGHT_XP / 2.0
+    bottom_z = TARGET_CENTER_XP[2] - TARGET_HEIGHT_XP / 2.0
+    circ_pts = xp.array([
+        [TARGET_CENTER_XP[0] + TARGET_RADIUS_XP, TARGET_CENTER_XP[1], top_z],
+        [TARGET_CENTER_XP[0] - TARGET_RADIUS_XP, TARGET_CENTER_XP[1], top_z],
+        [TARGET_CENTER_XP[0], TARGET_CENTER_XP[1] + TARGET_RADIUS_XP, top_z],
+        [TARGET_CENTER_XP[0], TARGET_CENTER_XP[1] - TARGET_RADIUS_XP, top_z],
+        [TARGET_CENTER_XP[0] + TARGET_RADIUS_XP, TARGET_CENTER_XP[1], bottom_z],
+        [TARGET_CENTER_XP[0] - TARGET_RADIUS_XP, TARGET_CENTER_XP[1], bottom_z],
+        [TARGET_CENTER_XP[0], TARGET_CENTER_XP[1] + TARGET_RADIUS_XP, bottom_z],
+        [TARGET_CENTER_XP[0], TARGET_CENTER_XP[1] - TARGET_RADIUS_XP, bottom_z]
+    ], dtype=xp.float64)  # (8,3)
 
+    idxs = xp.where(center_blocked)[0]
+    if idxs.size == 0:
+        return xp.zeros_like(TIMES_XP, dtype=xp.bool_)
 
-def missile_pos(t, M0=MISSILE_INIT, target=TARGET_CENTER):
-    """导弹在时刻 t 的位置"""
-    direction = (target - M0)
-    direction = direction / np.linalg.norm(direction)
-    return M0 + direction * MISSILE_SPEED * t
+    p1_sel = p1[idxs]               # (M_sel,3)
+    smoke_sel = smoke_centers[idxs] # (M_sel,3)
+    p2_sel = xp.broadcast_to(TARGET_CENTER_XP, p1_sel.shape)
+    v_sel = p2_sel - p1_sel
+    denom = xp.linalg.norm(v_sel, axis=1) + 1e-9
 
+    rel_pts = circ_pts - TARGET_CENTER_XP      # (8,3)
+    v_exp = v_sel[:, None, :]                  # (M_sel,1,3)
+    rel_exp = xp.broadcast_to(rel_pts[None, :, :], (v_sel.shape[0], rel_pts.shape[0], 3))  # (M_sel,8,3)
+    cross_prod = xp.cross(v_exp, rel_exp, axis=2)  # (M_sel,8,3)
+    num = xp.linalg.norm(cross_prod, axis=2)       # (M_sel,8)
+    dists = num / (denom[:, None] + 1e-9)          # (M_sel,8)
 
-def simulate_coverage(bombs, t_max=T_MAX, dt=DT):
+    fully_blocked_sel = xp.all(dists <= SMOKE_RADIUS_XP, axis=1)  # (M_sel,)
+
+    res_mask = xp.zeros_like(TIMES_XP, dtype=xp.bool_)
+    active_indices = xp.where(active_mask)[0]
+    set_indices = active_indices[idxs]  # indices in TIMES_XP
+    res_mask[set_indices] = fully_blocked_sel
+    return res_mask
+
+# ---------------------------
+# 聚合遮蔽（所有炸弹）
+# ---------------------------
+def simulate_coverage_from_bombs(bombs):
     """
-    计算给定爆炸点序列的总遮蔽时间
-    bombs: [(t_b, pos), ...]
+    bombs: list of (t_b, pos_b, t_d)
+    返回 (total_coverage_xp_scalar, list_of_per_bomb_xp_scalar)
     """
-    covered = []
-    for t in np.arange(0, t_max, dt):
-        m_pos = missile_pos(t)
-        blocked = False
-        for (t_b, pos_b) in bombs:
-            if t < t_b or t > t_b + SMOKE_LIFE:
-                continue
-            smoke_center = np.array([pos_b[0], pos_b[1], pos_b[2] - SMOKE_SINK * (t - t_b)])
-            if is_blocked(m_pos, TARGET_CENTER, smoke_center, SMOKE_RADIUS):
-                blocked = True
-                break
-        covered.append(blocked)
-    return np.sum(covered) * dt
+    if not bombs:
+        return xp.array(0.0, dtype=xp.float64), [xp.array(0.0, dtype=xp.float64)] * 0
 
+    blocked_any = xp.zeros_like(TIMES_XP, dtype=xp.bool_)
+    per_masks = []
+    for (t_b, pos_b, t_d) in bombs:
+        mask = vectorized_block_mask_for_bomb(t_b, pos_b, t_d)
+        per_masks.append(mask)
+        blocked_any = blocked_any | mask
 
-def simulate_single_coverage(t_b, pos_b, t_max=T_MAX, dt=DT):
-    """计算单个烟幕弹的遮蔽时间"""
-    covered = []
-    for t in np.arange(0, t_max, dt):
-        m_pos = missile_pos(t)
-        if t < t_b or t > t_b + SMOKE_LIFE:
-            blocked = False
-        else:
-            smoke_center = np.array([pos_b[0], pos_b[1], pos_b[2] - SMOKE_SINK * (t - t_b)])
-            blocked = is_blocked(m_pos, TARGET_CENTER, smoke_center, SMOKE_RADIUS)
-        covered.append(blocked)
-    return np.sum(covered) * dt
+    total_coverage = xp.sum(blocked_any) * DT
+    per_cov = [xp.sum(m) * DT for m in per_masks]
+    return total_coverage, per_cov
 
+def simulate_single_coverage_scalar(t_b, pos_b, t_d):
+    mask = vectorized_block_mask_for_bomb(t_b, pos_b, t_d)
+    return xp.sum(mask) * DT
 
-def get_coverage_from_params(params, num_bombs=NUM_BOMBS):
-    """计算给定参数的总遮蔽时间和每个烟幕弹的贡献。"""
-    theta_deg, v = params[:2]
+# ---------------------------
+# 参数映射（params -> bombs）
+# ---------------------------
+# 优化参数格式：
+# [dx, dy, v, t1, d1, t2, d2, t3, d3]
+# dx, dy：无人机二维航向向量分量
+# v：无人机速度
+# ti：第 i 枚烟幕弹的投放时机
+# di：第 i 枚烟幕弹的爆炸延迟时间
+def params_to_bombs(params, num_bombs=NUM_BOMBS):
+    """
+    params: numpy array-like [dx, dy, v, t1, d1, t2, d2, t3, d3]
+    返回：list of (t_b (float), pos_b xp array(3,), t_d (float))
+    内部把必要量转换为 xp，保证一致性
+    """
+    dx = float(params[0]); dy = float(params[1]); v = float(params[2])
     
-    # 将角度从度转换为弧度进行计算
-    theta_rad = np.deg2rad(theta_deg)
-    
-    direction = np.array([np.cos(theta_rad), np.sin(theta_rad), 0.0])
-    direction = direction / np.linalg.norm(direction)
-    
-    per_drop_coverage = {}
-    bombs_list = []
+    bombs = []
+    dir_vec = normalize_xy(dx, dy)  # xp vector (3,)
     
     for i in range(num_bombs):
-        t_b = params[2 + i]
-        pos = UAV_INIT + direction * v * t_b
+        t_drop = float(params[3 + 2 * i])
+        t_delay = float(params[4 + 2 * i])
+        pos = UAV_INIT_XP + dir_vec * (v * t_drop)
+        bombs.append((t_drop, pos, t_delay))
         
-        bombs_list.append((t_b, pos))
-    
-    # 计算每个烟幕弹的独立贡献
-    for i, (t_b, pos) in enumerate(bombs_list):
-        coverage = simulate_single_coverage(t_b, pos)
-        per_drop_coverage[f'Bomb-{i+1}'] = coverage
+    return bombs
 
-    # 计算总遮蔽时间
-    total_coverage = simulate_coverage(bombs_list)
+def get_coverage_from_params(params, num_bombs=NUM_BOMBS):
+    """
+    params: numpy array-like
+    返回 (total_coverage_float, per_drop_dict)
+    """
+    bombs = params_to_bombs(params, num_bombs)
+    per_drop = {}
+    for i, (t_b, pos_b, t_d) in enumerate(bombs):
+        cov = simulate_single_coverage_scalar(t_b, pos_b, t_d)
+        per_drop[f'Bomb-{i+1}'] = float(xp.asnumpy(cov)) if USE_GPU else float(cov)
+        
+    total_cov_xp, per_cov_list = simulate_coverage_from_bombs(bombs)
+    total_cov = float(xp.asnumpy(total_cov_xp)) if USE_GPU else float(total_cov_xp)
+    return total_cov, per_drop
 
-    return total_coverage, per_drop_coverage
-
-# ======================
-# 优化目标函数
-# ======================
-
+# ---------------------------
+# 目标函数（无副作用）
+# ---------------------------
+# 优化目标：最大化烟幕弹产生的总有效遮蔽时间
+# 约束条件：相邻两次投掷的时间间隔必须大于1秒
 def global_evaluate(params):
     """
-    粗略优化目标函数：最小化 -所有烟幕弹贡献时间总和
-    此阶段旨在确保每个烟幕弹都尽可能地有效。
-    参数: [theta, v, t1, t2, t3]
+    粗略目标：-sum(each bomb independent coverage)
+    params: numpy array-like [dx,dy,v,t1,d1,...]
     """
-    theta_deg, v = params[:2]
-    t_drops = params[2:]
+    # 按照投放时间 t_drop 排序
+    t_drops = np.array([params[3 + 2 * i] for i in range(NUM_BOMBS)])
+    sorted_idx = np.argsort(t_drops)
     
-    # 投放间隔至少1s，如果间隔太小，则施加惩罚
-    t_drops.sort()
-    for i in range(len(t_drops) - 1):
-        if t_drops[i+1] - t_drops[i] < 1.0:
-            return 1e6
+    sorted_params = np.array(params, dtype=float)
+    for i, original_idx in enumerate(sorted_idx):
+        sorted_params[3 + 2 * i] = params[3 + 2 * original_idx]
+        sorted_params[4 + 2 * i] = params[4 + 2 * original_idx]
+        
+    # 投放时间间隔太近则惩罚
+    if np.any(np.diff(sorted_params[3::2]) < 1.0):
+        return 1e6
 
-    theta_rad = np.deg2rad(theta_deg)
-    direction = np.array([np.cos(theta_rad), np.sin(theta_rad), 0.0])
-    bombs = []
-    for t_b in t_drops:
-        pos = UAV_INIT + direction * v * t_b
-        bombs.append((t_b, pos))
-
-    # 计算每个烟幕弹的贡献总和作为优化目标
-    total_individual_coverage = 0
-    for t_b, pos in bombs:
-        total_individual_coverage += simulate_single_coverage(t_b, pos)
-
-    return -total_individual_coverage
-
+    bombs = params_to_bombs(sorted_params, NUM_BOMBS)
+    total_individual = 0.0
+    for (t_b, pos_b, t_d) in bombs:
+        cov = simulate_single_coverage_scalar(t_b, pos_b, t_d)
+        total_individual += float(xp.asnumpy(cov)) if USE_GPU else float(cov)
+    return float(-total_individual)
 
 def final_evaluate(params):
     """
-    精细优化目标函数：最小化 -最终总遮蔽时间
-    此阶段旨在基于粗略优化结果进行微调，以最大化总遮蔽时间。
-    参数: [theta, v, t1, t2, t3]
+    精细目标：-total coverage considering overlap
+    params: numpy array-like
     """
-    theta_deg, v = params[:2]
-    t_drops = params[2:]
+    # 按照投放时间 t_drop 排序
+    t_drops = np.array([params[3 + 2 * i] for i in range(NUM_BOMBS)])
+    sorted_idx = np.argsort(t_drops)
     
-    # 投放间隔至少1s，如果间隔太小，则施加惩罚
-    t_drops.sort()
-    for i in range(len(t_drops) - 1):
-        if t_drops[i+1] - t_drops[i] < 1.0:
-            return 1e6
+    sorted_params = np.array(params, dtype=float)
+    for i, original_idx in enumerate(sorted_idx):
+        sorted_params[3 + 2 * i] = params[3 + 2 * original_idx]
+        sorted_params[4 + 2 * i] = params[4 + 2 * original_idx]
+        
+    # 投放时间间隔太近则惩罚
+    if np.any(np.diff(sorted_params[3::2]) < 1.0):
+        return 1e6
 
-    theta_rad = np.deg2rad(theta_deg)
-    direction = np.array([np.cos(theta_rad), np.sin(theta_rad), 0.0])
-    bombs = []
-    for t_b in t_drops:
-        pos = UAV_INIT + direction * v * t_b
-        bombs.append((t_b, pos))
+    bombs = params_to_bombs(sorted_params, NUM_BOMBS)
+    total_cov_xp, _ = simulate_coverage_from_bombs(bombs)
+    total_cov = float(xp.asnumpy(total_cov_xp)) if USE_GPU else float(total_cov_xp)
+    return float(-total_cov)
 
-    # 计算总遮蔽时间作为最终优化目标
-    score = simulate_coverage(bombs)
-    return -score
-
-
-def _generate_excel_data(best_params, per_drop_coverage):
-    """生成用于Excel导出的数据列表。"""
-    if best_params is None:
-        return []
-
-    theta_deg, v = best_params[:2]
-    t_drops = best_params[2:]
+# ---------------------------
+# 随机预热（warm start）
+# ---------------------------
+def random_warm_start(n_samples=500, num_bombs=NUM_BOMBS):
+    """
+    随机采样求 warm-start（返回 numpy params 与对应覆盖）
+    params format: [dx,dy,v,t1,d1,...]
+    """
+    best_score = -1e9
+    best_params = None
+    # sample in numpy (optimizer wants numpy)
+    dxs = np.random.uniform(-1.0, 1.0, size=n_samples)
+    dys = np.random.uniform(-1.0, 1.0, size=n_samples)
+    vs = np.random.uniform(70.0, 140.0, size=n_samples)
     
-    drop_data = []
+    t_drops = np.random.uniform(0.0, T_MAX, size=(n_samples, num_bombs))
+    t_delays = np.random.uniform(0.0, T_FALL_MAX, size=(n_samples, num_bombs))
     
-    # 确保烟幕弹按投放时间顺序排序
-    sorted_drops = sorted(zip(t_drops, per_drop_coverage.keys()), key=lambda x: x[0])
-
-    theta_rad = np.deg2rad(theta_deg)
-    direction_vec = np.array([np.cos(theta_rad), np.sin(theta_rad), 0.0])
-    
-    for t_drop, bomb_name in sorted_drops:
-        pos = UAV_INIT + direction_vec * v * t_drop
-        cover_time = per_drop_coverage.get(bomb_name, 0.0)
+    for k in range(n_samples):
+        params_k = np.zeros(3 + 2 * num_bombs)
+        params_k[0] = dxs[k]
+        params_k[1] = dys[k]
+        params_k[2] = vs[k]
+        params_k[3::2] = t_drops[k]
+        params_k[4::2] = t_delays[k]
+        
+        # evaluate using final_evaluate (which handles numpy input)
+        cov = -final_evaluate(params_k)
+        if cov > best_score:
+            best_score = cov
+            best_params = params_k.copy()
             
-        drop_data.append({
-            '无人机运动方向 (度)': theta_deg,
-            '无人机运动速度 (m/s)': v,
-            '烟幕干扰弹名称': bomb_name,
-            '烟幕干扰弹投放点的x坐标 (m)': pos[0],
-            '烟幕干扰弹投放点的y坐标 (m)': pos[1],
-            '烟幕干扰弹投放点的z坐标 (m)': pos[2],
-            '有效干扰时长 (s)': cover_time
-        })
-    return drop_data
+    return best_params, best_score
 
-
+# ---------------------------
+# 历史保存、Excel 输出
+# ---------------------------
 def _load_optimization_data(filepath):
-    """从文件中加载历史优化数据。"""
     try:
         with open(filepath, 'rb') as f:
             return pickle.load(f)
-    except (FileNotFoundError, EOFError):
-        print(f"未找到历史优化文件 {filepath}，将创建新文件。")
+    except Exception:
         return {'best_seed': None, 'best_coverage': -1.0, 'best_params': None, 'last_tried_seed': -1}
 
 def _save_optimization_data(data, filepath):
-    """将优化数据保存到文件。"""
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, 'wb') as f:
         pickle.dump(data, f)
-        print(f"历史优化数据已成功保存到 {filepath}。")
 
-# ======================
-# 主程序
-# ======================
+def generate_excel_rows(best_params, per_drop_coverage):
+    if best_params is None:
+        return []
+    
+    dx = float(best_params[0]); dy = float(best_params[1]); v = float(best_params[2])
+    
+    # 提取投放时间和延迟时间
+    t_drops = np.array([best_params[3 + 2 * i] for i in range(NUM_BOMBS)], dtype=float)
+    t_delays = np.array([best_params[4 + 2 * i] for i in range(NUM_BOMBS)], dtype=float)
+    
+    # 排序以美化输出
+    sorted_with_idx = sorted(list(enumerate(t_drops)), key=lambda x: x[1])
+    
+    direction_vec = np.array([dx, dy, 0.0])
+    nrm = np.linalg.norm(direction_vec) + 1e-12
+    direction_vec = direction_vec / nrm
+    
+    rows = []
+    for i, (orig_idx, t_drop) in enumerate(sorted_with_idx):
+        pos = (np.array(xp.asnumpy(UAV_INIT_XP)) + direction_vec * (v * t_drop))
+        bomb_name = f'Bomb-{orig_idx+1}'
+        cover_time = per_drop_coverage.get(bomb_name, 0.0)
+        
+        rows.append({
+            '无人机运动方向_dx': dx,
+            '无人机运动方向_dy': dy,
+            '无人机运动速度 (m/s)': v,
+            '烟幕干扰弹名称': i + 1,
+            '烟幕干扰弹投放点的x坐标 (m)': float(pos[0]),
+            '烟幕干扰弹投放点的y坐标 (m)': float(pos[1]),
+            '烟幕干扰弹投放点的z坐标 (m)': float(pos[2]),
+            '投放时机 (s)': float(t_drop),
+            '爆炸延迟时间 (s)': float(t_delays[orig_idx]),
+            '有效干扰时长 (s)': float(cover_time)
+        })
+        
+    return rows
 
-def run_optimization(num_runs=5, seed_file_path="Data/Q4/optimization_seed.pkl"):
-    """
-    运行多轮优化以寻找最佳烟幕弹投放方案。
+# ---------------------------
+# DE 回调（进度条）
+# ---------------------------
+pbar = None
+def de_callback(xk, convergence=None):
+    global pbar
+    if pbar is not None:
+        try:
+            pbar.update(1)
+        except Exception:
+            pass
 
-    Args:
-        num_runs (int): 运行优化的总次数。
-        seed_file_path (str): 保存历史最佳结果的文件路径。
-    """
+# ---------------------------
+# 主流程：三阶段 DE + 随机预热 + 局部优化
+# ---------------------------
+def run_optimization(num_runs=3,
+                     max_iter_stage1=200,
+                     max_iter_stage2=80,
+                     max_iter_stage3=30,
+                     seed_file_path="Data/Q3/optimization_seed.pkl",
+                     use_random_warmup=True,
+                     warmup_samples=400):
+    global pbar
+    history = _load_optimization_data(seed_file_path)
+
     for run_num in range(1, num_runs + 1):
-        print("="*40)
+        print("\n" + "="*60)
         print(f"开始第 {run_num}/{num_runs} 次优化运行")
-        print("="*40)
+        print("="*60)
+        last_seed = history.get('last_tried_seed', -1)
+        current_seed = last_seed + 1
+        print(f"随机种子: {current_seed}")
+        np.random.seed(current_seed)
 
-        history = _load_optimization_data(seed_file_path)
-        historical_best_coverage = history.get('best_coverage', -1.0)
-        last_tried_seed = history.get('last_tried_seed', -1)
-        
-        current_seed = last_tried_seed + 1
-        
-        print(f"开始使用新随机种子: {current_seed} 进行优化...")
-        
-        # --- 阶段1: 粗略优化 (最大化所有烟幕弹的独立贡献) ---
-        print("=== 阶段1: 开始粗略优化 (最大化独立贡献总和) ===")
-        
+        # 随机预热
+        x0_guess = None
+        if use_random_warmup:
+            print("随机预热（warm start）中...")
+            x0_guess, warm_score = random_warm_start(n_samples=warmup_samples, num_bombs=NUM_BOMBS)
+            print(f"warm start 覆盖: {warm_score:.3f}")
+
+        # Stage 1: 粗略优化
+        print("\n=== 阶段1：粗略优化（global evaluate） ===")
+        # 优化参数：[dx, dy, v, t1, d1, t2, d2, t3, d3]
         bounds = [
-            (0, 360),     # 航向角 (度)
-            (70, 140),    # 无人机速度
-        ] + [(0, T_MAX)] * NUM_BOMBS
-        
+            (-1.0, 1.0),      # dx
+            (-1.0, 1.0),      # dy
+            (70.0, 140.0)     # v
+        ] + [(0.0, T_MAX), (0.0, T_FALL_MAX)] * NUM_BOMBS
+
+        pbar = tqdm(total=max_iter_stage1, desc="粗略优化")
         rough_result = differential_evolution(
             global_evaluate,
             bounds,
-            maxiter=400,    
-            popsize=50,
+            maxiter=max_iter_stage1,
+            popsize=40,
             polish=True,
-            disp=True,
-            seed=current_seed
+            disp=False,
+            seed=current_seed,
+            callback=de_callback
         )
-        
-        rough_best_params = rough_result.x
-        total_coverage_rough, per_drop_coverage_rough = get_coverage_from_params(rough_best_params, NUM_BOMBS)
-        
-        print("\n=== 粗略优化结果 ===")
-        print(f"无人机航向角: {rough_best_params[0]:.2f}° , 速度: {rough_best_params[1]:.2f} m/s")
-        print(f"总独立贡献时间: {sum(per_drop_coverage_rough.values()):.2f} s")
-        print(f"实际总遮蔽时间 (粗略优化): {total_coverage_rough:.2f} s")
-        print("每个烟幕弹贡献:", {k: f"{v:.2f}" for k, v in per_drop_coverage_rough.items()})
+        pbar.close()
+        rough_best_params = rough_result.x.copy()
+        total_cov_rough, per_drop_rough = get_coverage_from_params(rough_best_params, NUM_BOMBS)
+        print("阶段1 完成：")
+        print(f"  dx,dy = {rough_best_params[0]:.4f}, {rough_best_params[1]:.4f}, v = {rough_best_params[2]:.2f}")
+        print(f"  各炸弹独立贡献和(approx): {sum(per_drop_rough.values()):.3f} s")
+        print(f"  实际总遮蔽(粗略): {total_cov_rough:.3f} s")
 
-        # --- 阶段2: 精细优化 (最大化最终总遮蔽时间) ---
-        print("\n=== 阶段2: 开始精细优化 (基于粗略结果微调) ===")
-        
+        # Stage 2: 精细优化
+        print("\n=== 阶段2：精细优化（final evaluate） ===")
+        pbar = tqdm(total=max_iter_stage2, desc="精细优化")
+        x0_to_use = rough_best_params.copy()
+        if x0_guess is not None:
+            # 使用随机预热结果作为初始猜想
+            x0_to_use[0:3] = x0_guess[0:3]
+            for i in range(NUM_BOMBS):
+                x0_to_use[3 + 2 * i] = x0_guess[3 + 2 * i]
+                x0_to_use[4 + 2 * i] = x0_guess[4 + 2 * i]
+                
         fine_result = differential_evolution(
             final_evaluate,
             bounds,
-            maxiter=100, 
+            maxiter=max_iter_stage2,
             popsize=20,
-            x0=rough_best_params,
+            x0=x0_to_use,
             polish=True,
-            disp=True,
-            seed=current_seed
+            disp=False,
+            seed=current_seed,
+            callback=de_callback
         )
-        
-        final_best_params = fine_result.x
-        final_total_coverage, final_per_drop_coverage = get_coverage_from_params(final_best_params, NUM_BOMBS)
-        
-        print("\n=== 精细优化后的最终结果 ===")
-        print(f"无人机航向角: {final_best_params[0]:.2f}° , 速度: {final_best_params[1]:.2f} m/s")
-        print(f"最终总遮蔽时间: {final_total_coverage:.2f} s")
-        print("每个烟幕弹最终贡献:", {k: f"{v:.2f}" for k, v in final_per_drop_coverage.items()})
+        pbar.close()
+        final_best_params = fine_result.x.copy()
+        final_total_cov, final_per_drop = get_coverage_from_params(final_best_params, NUM_BOMBS)
+        print("阶段2 完成：")
+        print(f"  dx,dy = {final_best_params[0]:.4f}, {final_best_params[1]:.4f}, v = {final_best_params[2]:.2f}")
+        print(f"  最终总遮蔽: {final_total_cov:.3f} s")
+        print(f"  每炸弹贡献: { {k: f'{v:.3f}' for k,v in final_per_drop.items()} }")
 
-        # --- 阶段3: 针对性优化 (优化无效烟幕弹) ---
-        ineffective_bombs = [i for i, (k, v) in enumerate(final_per_drop_coverage.items()) if v < 0.1]
-        
-        if ineffective_bombs:
-            print("\n=== 阶段3: 开始针对性优化 (优化无效烟幕弹) ===")
-
-            # 创建一个局部优化函数，只改变单个烟幕弹的投放时间
-            def targeted_evaluate(t_drop_new, params_fixed, bomb_index_to_optimize):
-                params_temp = np.array(params_fixed)
-                params_temp[2 + bomb_index_to_optimize] = t_drop_new[0]
-                # 这里调用final_evaluate是因为我们想在总遮蔽时间的基础上优化这个投放点
-                return final_evaluate(params_temp)
-
-            for idx in ineffective_bombs:
-                bomb_name = f'Bomb-{idx + 1}'
-                initial_t = final_best_params[2 + idx]
+        # Stage 3: 针对性局部优化
+        # 找出贡献度低的炸弹，只优化其投放时间和延迟
+        ineffective = [i for i, (k, v) in enumerate(final_per_drop.items()) if v < 0.1]
+        if ineffective:
+            print("\n=== 阶段3：针对性局部优化 ===")
+            for idx in ineffective:
+                bomb_name = f'Bomb-{idx+1}'
+                initial_t = final_best_params[3 + 2 * idx]
+                initial_d = final_best_params[4 + 2 * idx]
+                print(f"  局部优化 {bomb_name} 初始时间 {initial_t:.2f}s, 延迟 {initial_d:.2f}s")
                 
-                print(f"对 {bomb_name} 进行局部优化，初始投放时间: {initial_t:.2f} s")
+                def targeted_eval_wrapper(td_arr, params_fixed, bomb_idx):
+                    params_tmp = np.array(params_fixed, dtype=float)
+                    params_tmp[3 + 2 * bomb_idx] = float(td_arr[0])
+                    params_tmp[4 + 2 * bomb_idx] = float(td_arr[1])
+                    return final_evaluate(params_tmp)
+                    
+                local_bounds = [
+                    (max(0.0, initial_t - 5.0), min(T_MAX, initial_t + 5.0)),
+                    (max(0.0, initial_d - 5.0), min(T_FALL_MAX, initial_d + 5.0))
+                ]
                 
-                # 设定一个窄的搜索范围，在初始投放时间附近进行搜索
-                local_bounds = [(max(0, initial_t - 5), min(T_MAX, initial_t + 5))]
-                
-                local_result = differential_evolution(
-                    lambda t_drop_new: targeted_evaluate(t_drop_new, final_best_params, idx),
+                pbar = tqdm(total=max_iter_stage3, desc=f"局部优化 {bomb_name}")
+                local_res = differential_evolution(
+                    lambda x: targeted_eval_wrapper(x, final_best_params, idx),
                     local_bounds,
-                    maxiter=50, 
+                    maxiter=max_iter_stage3,
                     popsize=10,
                     polish=True,
                     disp=False,
-                    seed=current_seed
+                    seed=current_seed,
+                    callback=de_callback
                 )
-                
-                # 更新最佳参数
-                final_best_params[2 + idx] = local_result.x[0]
+                pbar.close()
+                final_best_params[3 + 2 * idx] = local_res.x[0]
+                final_best_params[4 + 2 * idx] = local_res.x[1]
+            final_total_cov, final_per_drop = get_coverage_from_params(final_best_params, NUM_BOMBS)
+            print("局部优化后：")
+            print(f"  总遮蔽: {final_total_cov:.3f} s")
+            print(f"  每炸弹贡献: { {k: f'{v:.3f}' for k,v in final_per_drop.items()} }")
 
-            # 重新计算最终结果
-            final_total_coverage, final_per_drop_coverage = get_coverage_from_params(final_best_params, NUM_BOMBS)
-            
-            print("\n=== 针对性优化后的最终结果 ===")
-            print(f"最终总遮蔽时间: {final_total_coverage:.2f} s")
-            print("每个烟幕弹最终贡献:", {k: f"{v:.2f}" for k, v in final_per_drop_coverage.items()})
-
-        # --- 比较并更新历史最佳结果 ---
-        if final_total_coverage > historical_best_coverage:
-            print("\n本次优化找到比历史最佳更好的结果！正在更新历史记录。")
-            history['best_coverage'] = final_total_coverage
+        # 更新历史
+        hist_best = history.get('best_coverage', -1.0)
+        if final_total_cov > hist_best:
+            print("本次为历史新高，更新记录。")
+            history['best_coverage'] = final_total_cov
             history['best_seed'] = current_seed
-            history['best_params'] = final_best_params
+            history['best_params'] = final_best_params.copy()
         else:
-            print(f"\n本次结果 ({final_total_coverage:.2f} s) 不如历史最佳 ({historical_best_coverage:.2f} s)，沿用历史最佳参数。")
-        
-        # 无论是否找到更好的结果，都更新上次尝试的种子
+            print(f"本次({final_total_cov:.3f}s)未超过历史最佳({hist_best:.3f}s)。")
         history['last_tried_seed'] = current_seed
         _save_optimization_data(history, seed_file_path)
+        print("本次运行结束并保存历史。")
 
-    return history['best_params'], history['best_coverage']
+    return history.get('best_params', None), history.get('best_coverage', -1.0)
 
+# ---------------------------
+# 绘图（半透明球体）
+# ---------------------------
+def plot_results(best_params):
+    if best_params is None:
+        print("没有最优参数，无法绘图。")
+        return
+    
+    # 解析最优参数
+    bp = np.array(best_params, dtype=float)
+    dx, dy, v = bp[0], bp[1], bp[2]
+    t_drops = np.array([bp[3 + 2 * i] for i in range(NUM_BOMBS)], dtype=float)
+    t_delays = np.array([bp[4 + 2 * i] for i in range(NUM_BOMBS)], dtype=float)
+
+    # 计算无人机运动方向向量
+    dir_vec = np.array([dx, dy, 0.0])
+    dir_vec = dir_vec / (np.linalg.norm(dir_vec) + 1e-12)
+    
+    # 投放点位置
+    bomb_positions = np.array([np.array(xp.asnumpy(UAV_INIT_XP)) + dir_vec * (v * t) for t in t_drops])
+
+    # 导弹轨迹 (cpu)
+    times = np.arange(0.0, T_MAX + 1e-9, DT)
+    dir_m = (np.array(TARGET_CENTER) - np.array(MISSILE_INIT))
+    dir_m = dir_m / np.linalg.norm(dir_m)
+    missile_traj = np.array(MISSILE_INIT) + np.outer(times, dir_m * MISSILE_SPEED)
+
+    fig = plt.figure(figsize=(10,7))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.plot(missile_traj[:,0], missile_traj[:,1], missile_traj[:,2], 'r-', label='导弹轨迹')
+
+    # 无人机路径
+    drone_traj = np.array([np.array(xp.asnumpy(UAV_INIT_XP)) + dir_vec * (v * t) for t in times])
+    ax.plot(drone_traj[:,0], drone_traj[:,1], drone_traj[:,2], 'b--', label='无人机轨迹')
+
+    # 半透明球体表示烟幕爆炸点
+    u = np.linspace(0, 2*np.pi, 30)
+    v_ang = np.linspace(0, np.pi, 15)
+    uu, vv_ang = np.meshgrid(u, v_ang)
+    for i, pos in enumerate(bomb_positions):
+        x = pos[0] + SMOKE_RADIUS * np.cos(uu) * np.sin(vv_ang)
+        y = pos[1] + SMOKE_RADIUS * np.sin(uu) * np.sin(vv_ang)
+        z = pos[2] + SMOKE_RADIUS * np.cos(vv_ang)
+        ax.plot_surface(x, y, z, color='green', alpha=0.12, linewidth=0)
+
+    # 投放点标记
+    ax.scatter(bomb_positions[:,0], bomb_positions[:,1], bomb_positions[:,2], c='g', s=60, label='烟幕弹投放点')
+    ax.scatter(np.array(UAV_INIT)[0], np.array(UAV_INIT)[1], np.array(UAV_INIT)[2], marker='^', s=80, label='无人机起始点')
+    ax.scatter(np.array(TARGET_CENTER)[0], np.array(TARGET_CENTER)[1], np.array(TARGET_CENTER)[2], marker='x', s=80, label='目标')
+
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    ax.set_zlabel("Z (m)")
+    ax.legend()
+    plt.title("导弹轨迹 / 无人机轨迹 / 烟幕示意")
+    plt.show()
+
+# ---------------------------
+# main
+# ---------------------------
 if __name__ == "__main__":
-    NUM_RUNS_TO_RUN = 5 # 更改运行的次数
-    SEED_FILE_PATH = "Data/Q3/optimization_seed.pkl"
-    EXCEL_FILE_PATH = "Data/result1.xlsx"
+    SEED_FILE = "Data/Q3/optimization_seed.pkl"
+    EXCEL_PATH = "Data/Q3/result.xlsx"
+    NUM_RUNS = 2
+    MAX_ITER_STAGE1 = 200   # 调试时可设小一点
+    MAX_ITER_STAGE2 = 80
+    MAX_ITER_STAGE3 = 30
 
-    best_params, best_coverage = run_optimization(num_runs=NUM_RUNS_TO_RUN, seed_file_path=SEED_FILE_PATH)
-    
-    print("\n\n" + "="*40)
-    print("所有运行完成，以下为历史最佳结果")
-    print("="*40)
-    
+    best_params, best_cov = run_optimization(
+        num_runs=NUM_RUNS,
+        max_iter_stage1=MAX_ITER_STAGE1,
+        max_iter_stage2=MAX_ITER_STAGE2,
+        max_iter_stage3=MAX_ITER_STAGE3,
+        seed_file_path=SEED_FILE,
+        use_random_warmup=True,
+        warmup_samples=300
+    )
+
+    print("\n==== 所有运行完成 ====")
+    print("历史最佳覆盖 (s):", best_cov)
     if best_params is not None:
-        final_total_coverage, final_per_drop_coverage = get_coverage_from_params(best_params, NUM_BOMBS)
-        print(f"历史最佳总遮蔽时间: {final_total_coverage:.2f} s")
-        print("历史最佳参数:")
-        print(f"无人机航向角: {best_params[0]:.2f}° , 速度: {best_params[1]:.2f} m/s")
-        
-        # 为了美观，对烟幕弹贡献进行格式化输出
-        sorted_per_drop = sorted(final_per_drop_coverage.items(), key=lambda item: float(item[0].split('-')[1]))
-        print("每个烟幕弹贡献:", {k: f"{v:.2f}" for k, v in dict(sorted_per_drop).items()})
+        total_cov, per_drop = get_coverage_from_params(best_params, NUM_BOMBS)
+        print("最终最佳参数 (dx,dy,v,t1,d1,...):", np.round(best_params, 4))
+        print("每个烟幕贡献:", {k: f"{v:.3f}" for k,v in per_drop.items()})
 
-        # --- 结果保存 ---
-        os.makedirs(os.path.dirname(EXCEL_FILE_PATH), exist_ok=True)
-        excel_data = _generate_excel_data(best_params, final_per_drop_coverage)
-        
-        if excel_data:
-            df = pd.DataFrame(excel_data)
-            df.to_excel(EXCEL_FILE_PATH, index=False)
-            print(f"\n最终结果已保存到 {EXCEL_FILE_PATH}")
+        # 保存到 Excel
+        rows = generate_excel_rows(best_params, per_drop)
+        if rows:
+            os.makedirs(os.path.dirname(EXCEL_PATH), exist_ok=True)
+            df = pd.DataFrame(rows)
+            df.to_excel(EXCEL_PATH, index=False)
+            print("Excel 已保存到：", EXCEL_PATH)
         else:
-            print("\n没有找到有效的遮蔽方案，未生成 Excel 文件。")
+            print("没有生成 Excel 行。")
+
+        # 绘图
+        try:
+            plot_results(best_params)
+        except Exception as e:
+            print("绘图失败：", e)
     else:
-        print("未找到历史最佳参数，请重新运行。")
+        print("未找到最佳参数，结束。")
